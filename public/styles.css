@@ -154,3 +154,40 @@ td.mono, th.mono { font-family: ui-monospace, monospace; }
 .silent { color: var(--muted); }
 .pair-table tr.looprow td { background: rgba(55,192,125,.07); }
 footer { padding: 10px 28px 22px; color: var(--muted); font-size: 12px; }
+
+/* ---- 最小标记布设审计 ---- */
+button#placement { border-color: var(--warn); color: var(--warn); }
+button#placement:disabled { opacity: .45; }
+.verdict-good {
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--good);
+  background: var(--good-bg);
+  border-radius: 6px;
+  color: var(--good);
+  font-size: 13px;
+}
+.mark-chip code { color: inherit; }
+.constraint {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  background: #121a2b;
+}
+.witness-details summary { cursor: pointer; font-size: 12.5px; color: var(--text); }
+.witness-details summary code { color: var(--bad); }
+.witness-details[open] summary { margin-bottom: 4px; }
+.eval-input {
+  flex: 1;
+  min-width: 180px;
+  background: #0a0f1a;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 10px;
+  font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.eval-input:focus { outline: 1px solid var(--accent); }
+table tr.killed td { color: var(--good); }

@@ -1,15 +1,21 @@
-// worker.mjs — 在工作线程中执行判定，主线程可随时 terminate 取消
+// worker.mjs — 在工作线程中执行判定 / 布设审计，主线程可随时 terminate 取消
 import { parentPort } from 'node:worker_threads';
-import { analyze } from './analyze.mjs';
+import { analyze, placementAudit, evaluatePlacement } from './analyze.mjs';
 
 parentPort.on('message', (msg) => {
-  if (msg?.type !== 'run') return;
+  const reply = (payload) =>
+    parentPort.postMessage({ jobId: msg.jobId, ...payload });
   try {
-    const result = analyze(msg.spec);
-    parentPort.postMessage({ type: 'result', jobId: msg.jobId, result });
+    if (msg?.type === 'run') {
+      reply({ type: 'result', result: analyze(msg.spec) });
+    } else if (msg?.type === 'placement') {
+      reply({ type: 'result', result: placementAudit(msg.spec) });
+    } else if (msg?.type === 'eval-marks') {
+      reply({ type: 'result', result: evaluatePlacement(msg.spec, msg.marks) });
+    }
   } catch (err) {
-    parentPort.postMessage({
-      type: 'error', jobId: msg.jobId,
+    reply({
+      type: 'error',
       error: { message: String(err?.message ?? err) },
     });
   }

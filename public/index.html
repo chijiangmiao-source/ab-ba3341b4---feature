@@ -12,6 +12,8 @@
   <p class="sub">
     判定是否存在<strong>已发生故障的无限执行</strong>与<strong>从未发生故障的无限执行</strong>，
     其可观察回执序列逐元素完全相同（静默迁移不产生回执，按 verifier / twin-plant 精确构造，不做有限回放）。
+    判为不可诊断后，可发起<strong>最小独立标记布设审计</strong>：从仍存活的无限伪装见证提取必须命中的故障迁移，
+    精确分支定界求全局最少专属可观察标记，并展示每个标记打断的反例约束。
   </p>
 </header>
 
@@ -30,11 +32,13 @@
     </div>
     <div class="toolbar">
       <button id="submit" type="button">提交判定</button>
+      <button id="placement" type="button" disabled>发起最小标记布设审计</button>
       <button id="cancel" type="button" disabled>取消计算</button>
       <span id="dirty" class="dirty-flag" hidden>规程已修改 · 当前结果可能过期</span>
       <span class="spacer"></span>
       <button class="linklike" id="load-silent" type="button">示例：静默双环（不可诊断）</button>
       <button class="linklike" id="load-diag" type="button">示例：可诊断回执</button>
+      <button class="linklike" id="load-twofault" type="button">示例：双故障共伪装（需 2 标记）</button>
     </div>
     <div id="errors" class="errors" hidden></div>
   </section>

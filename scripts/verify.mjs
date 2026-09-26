@@ -142,6 +142,64 @@ trans n1 0 2 N a
   const h = await r.json();
   expect(h.activeJobs === 0, '取消/完成后无残留任务');
 
+  // 7) 最小标记布设审计：静默双环最小布设 {f1}
+  r = await fetch(`${base}/api/placement`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-p1', spec: silentCase }),
+  });
+  payload = await r.json();
+  const p = payload.result?.placement;
+  expect(r.status === 200, '布设审计 API 200');
+  expect(p?.size === 1 && Array.isArray(p.marks) && p.marks[0] === 'f1',
+    '静默双环最小布设恰为 {f1}（不是逐个试装猜测）');
+  expect(p?.perMarkConstraints?.length === 1 &&
+    p.perMarkConstraints[0].witness?.hitFaultTrans?.includes('f1'),
+    '被选标记 f1 附经该迁移的反例约束');
+  expect(p?.smallerSetWitnesses?.length === 1 &&
+    p.smallerSetWitnesses[0].set.length === 0,
+    '空布设（更小集合）仍保留稳定反例');
+  expect(typeof p.stats?.nodesVisited === 'number' && p.stats.nodesVisited >= 1,
+    '给出分支定界复核统计');
+
+  // 8) 应用 {f1} 后新裁决＝可诊断；空集合仍不可诊断
+  r = await fetch(`${base}/api/placement/eval`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-e1', spec: silentCase, marks: ['f1'] }),
+  });
+  payload = await r.json();
+  expect(r.status === 200 && payload.result?.diagnosable === true,
+    '应用 {f1} 后裁决为可诊断');
+  r = await fetch(`${base}/api/placement/eval`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-e2', spec: silentCase, marks: [] }),
+  });
+  payload = await r.json();
+  expect(r.status === 200 && payload.result?.diagnosable === false &&
+    payload.result?.witness?.hitFaultTrans?.includes('f1'),
+    '空集合核对仍不可诊断且给出稳定反例');
+  r = await fetch(`${base}/api/placement/eval`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-e3', spec: silentCase, marks: ['g1'] }),
+  });
+  payload = await r.json();
+  expect(r.status === 200 && payload.result?.ok === false,
+    '非故障迁移标识被拒绝');
+
+  // 9) 原规程可诊断：布设审计明确返回空布设
+  r = await fetch(`${base}/api/placement`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-p2', spec: diagCase }),
+  });
+  payload = await r.json();
+  expect(r.status === 200 && payload.result?.placement?.alreadyDiagnosable === true &&
+    payload.result?.placement?.size === 0,
+    '原规程可诊断时明确返回空布设');
+
   cancelJob?.('not-a-job'); // 覆盖取消不存在任务的路径
   if (server) await new Promise((r) => server.close(r));
   console.log(failures === 0 ? '\n[verify] HTTP 冒烟全部通过' : `\n[verify] HTTP 冒烟失败 ${failures} 处`);
@@ -149,24 +207,28 @@ trans n1 0 2 N a
 }
 
 async function main() {
-  console.log('[verify] 1/4 构建检查（node --check 所有源文件）');
+  console.log('[verify] 1/5 构建检查（node --check 所有源文件）');
   const files = [
     'server.js', 'src/parser.mjs', 'src/diagnoser.mjs',
-    'src/analyze.mjs', 'src/worker.mjs', 'public/app.js',
-    'scripts/fuzz.mjs', 'scripts/verify.mjs',
+    'src/placement.mjs', 'src/analyze.mjs', 'src/worker.mjs',
+    'public/app.js', 'scripts/fuzz.mjs', 'scripts/placement-fuzz.mjs',
+    'scripts/verify.mjs',
   ];
   for (const f of files) {
     const code = await run('node', ['--check', f]);
     if (code !== 0) process.exit(1);
   }
 
-  console.log('\n[verify] 2/4 单元测试');
+  console.log('\n[verify] 2/5 单元测试');
   if ((await run('node', ['--test', 'test/'])) !== 0) process.exit(1);
 
-  console.log('\n[verify] 3/4 随机模型交叉验证（2000 例）');
+  console.log('\n[verify] 3/5 随机模型交叉验证（2000 例）');
   if ((await run('node', ['scripts/fuzz.mjs', '777', '2000'])) !== 0) process.exit(1);
 
-  console.log('\n[verify] 4/4 HTTP 冒烟');
+  console.log('\n[verify] 4/5 最小布设暴力交叉验证（1000 例）');
+  if ((await run('node', ['scripts/placement-fuzz.mjs', '31337', '1000'])) !== 0) process.exit(1);
+
+  console.log('\n[verify] 5/5 HTTP 冒烟');
   if ((await smoke()) !== 0) process.exit(1);
 
   console.log('\n[verify] ✅ 全部检查通过，verify 正常退出（exit 0）');

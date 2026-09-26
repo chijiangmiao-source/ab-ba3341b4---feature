@@ -82,3 +82,73 @@ test('取消不存在的任务返回 cancelled=false', async () => {
   assert.equal(r.status, 200);
   assert.equal(j.cancelled, false);
 });
+
+const PLACEMENT_SPEC = [
+  'loc 0', 'loc 1', 'loc 2', 'loc 3', 'init 0',
+  'trans f1 0 1 F SILENT',
+  'trans g1 1 2 N a', 'trans g2 2 1 N a',
+  'trans h1 0 3 N a', 'trans h2 3 0 N a',
+].join('\n');
+
+test('布设审计：静默双环给出最小布设 {f1}，应用后可诊断', async () => {
+  const { status, json } = await post('/api/placement', { jobId: 'p1', spec: PLACEMENT_SPEC });
+  assert.equal(status, 200);
+  const p = json.result.placement;
+  assert.equal(p.alreadyDiagnosable, false);
+  assert.equal(p.size, 1);
+  assert.deepEqual(p.marks, ['f1']);
+  assert.equal(p.perMarkConstraints[0].mark, 'f1');
+  assert.ok(p.perMarkConstraints[0].witness.hitFaultTrans.includes('f1'));
+  assert.equal(p.smallerSetWitnesses.length, 1);
+  assert.deepEqual(p.smallerSetWitnesses[0].set, []);
+});
+
+test('布设审计：原规程可诊断时明确返回空布设', async () => {
+  const spec = 'loc 0\nloc 1\nloc 2\ninit 0\ntrans f1 0 1 F a\ntrans t1 1 1 N b\ntrans n1 0 2 N a\n';
+  const { status, json } = await post('/api/placement', { jobId: 'p2', spec });
+  assert.equal(status, 200);
+  assert.equal(json.result.placement.alreadyDiagnosable, true);
+  assert.equal(json.result.placement.size, 0);
+  assert.deepEqual(json.result.placement.marks, []);
+});
+
+test('候选集合核对：{f1} 可诊断，空集合仍不可诊断', async () => {
+  const r1 = await post('/api/placement/eval', { jobId: 'e1', spec: PLACEMENT_SPEC, marks: ['f1'] });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.json.result.ok, true);
+  assert.equal(r1.json.result.diagnosable, true);
+  assert.equal(r1.json.result.witness, null);
+
+  const r2 = await post('/api/placement/eval', { jobId: 'e2', spec: PLACEMENT_SPEC, marks: [] });
+  assert.equal(r2.status, 200);
+  assert.equal(r2.json.result.diagnosable, false);
+  assert.ok(r2.json.result.witness.hitFaultTrans.includes('f1'));
+});
+
+test('候选核对拒绝非故障 / 非法标识', async () => {
+  const r1 = await post('/api/placement/eval', { jobId: 'e3', spec: PLACEMENT_SPEC, marks: ['g1'] });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.json.result.ok, false);
+  assert.deepEqual(r1.json.result.invalid, ['g1']);
+
+  const r2 = await post('/api/placement/eval', { jobId: 'e4', spec: PLACEMENT_SPEC, marks: ['bad id'] });
+  assert.equal(r2.status, 400);
+});
+
+test('布设审计任务同样受 supersedes / 取消保护', async () => {
+  const [r1] = await Promise.all([
+    fetch(`${base}/api/placement`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jobId: 'p-cancel', spec: PLACEMENT_SPEC }),
+    }).then(async (x) => ({ status: x.status, body: await x.text() })).catch((e) => ({ error: String(e) })),
+    (async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      const dr = await fetch(`${base}/api/jobs/p-cancel`, { method: 'DELETE' });
+      return dr.json();
+    })(),
+  ]);
+  assert.ok(r1.status === 200 || r1.status === 409 || r1.error);
+  const h = await (await fetch(`${base}/healthz`)).json();
+  assert.equal(h.activeJobs, 0);
+});

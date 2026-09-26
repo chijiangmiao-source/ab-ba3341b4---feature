@@ -1,10 +1,10 @@
-// server.mjs — 故障闭环审计页 HTTP 服务
+// server.js — 故障闭环审计页 HTTP 服务
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
-import { analyze } from './src/analyze.mjs';
+import { analyze, placementAudit, evaluatePlacement } from './src/analyze.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, 'public');
@@ -19,19 +19,20 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
-// 活动判定任务：jobId -> { worker, finished }
+// 活动任务：jobId -> { worker, finished }（判定 / 布设审计 / 候选核对共用）
 const jobs = new Map();
 
-function runJob(jobId, spec, { useWorker = true } = {}) {
+// task: { type: 'run' | 'placement' | 'eval-marks', spec, marks }
+function runJob(jobId, task, { useWorker = true } = {}) {
   return new Promise((resolve, reject) => {
     if (!useWorker) {
-      try { resolve(analyze(spec)); } catch (e) { reject(e); }
+      try { resolve(runInline(task)); } catch (e) { reject(e); }
       return;
     }
     const worker = new Worker(join(__dirname, 'src', 'worker.mjs'));
-    const rec = { worker, finished: false, reject };
+    const rec = { worker, finished: false, reject, timer: null };
     jobs.set(jobId, rec);
-    const timer = setTimeout(() => {
+    rec.timer = setTimeout(() => {
       if (!rec.finished) {
         rec.finished = true;
         worker.terminate();
@@ -42,27 +43,34 @@ function runJob(jobId, spec, { useWorker = true } = {}) {
     worker.on('message', (msg) => {
       if (rec.finished || msg.jobId !== jobId) return; // 过期/陌生回执一律丢弃
       rec.finished = true;
-      clearTimeout(timer);
+      clearTimeout(rec.timer);
       jobs.delete(jobId);
       worker.terminate();
       if (msg.type === 'result') resolve(msg.result);
-      else reject(new Error(msg.error?.message ?? '判定失败'));
+      else reject(new Error(msg.error?.message ?? '任务失败'));
     });
     worker.on('error', (err) => {
       if (rec.finished) return;
       rec.finished = true;
-      clearTimeout(timer);
+      clearTimeout(rec.timer);
       jobs.delete(jobId);
       reject(err);
     });
-    worker.postMessage({ type: 'run', jobId, spec });
+    worker.postMessage({ jobId, ...task });
   });
+}
+
+function runInline(task) {
+  if (task.type === 'placement') return placementAudit(task.spec);
+  if (task.type === 'eval-marks') return evaluatePlacement(task.spec, task.marks ?? []);
+  return analyze(task.spec);
 }
 
 function cancelJob(jobId) {
   const rec = jobs.get(jobId);
   if (rec && !rec.finished) {
     rec.finished = true;
+    clearTimeout(rec.timer);
     rec.worker.terminate(); // 过期任务立即停止，不可能再回写任何结果
     jobs.delete(jobId);
     rec.reject(Object.assign(new Error('任务已被新规程取代或取消'), { statusCode: 409 }));
@@ -89,14 +97,35 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req, 2 * 1024 * 1024);
       const jobId = String(body?.jobId ?? '');
       const spec = String(body?.spec ?? '');
-      const supersedes = body?.supersedes ? String(body.supersedes) : null;
-      if (!/^[A-Za-z0-9_-]{1,64}$/.test(jobId)) {
-        return sendJson(res, 400, { error: '非法 jobId' });
+      if (!validJobId(jobId)) return sendJson(res, 400, { error: '非法 jobId' });
+      supersede(body, jobId);
+      const result = await runJob(jobId, { type: 'run', spec });
+      return sendJson(res, 200, { jobId, result });
+    }
+
+    // 最小独立标记布设审计（原规程已判不可诊断后发起）
+    if (req.method === 'POST' && url.pathname === '/api/placement') {
+      const body = await readJson(req, 2 * 1024 * 1024);
+      const jobId = String(body?.jobId ?? '');
+      const spec = String(body?.spec ?? '');
+      if (!validJobId(jobId)) return sendJson(res, 400, { error: '非法 jobId' });
+      supersede(body, jobId);
+      const result = await runJob(jobId, { type: 'placement', spec });
+      return sendJson(res, 200, { jobId, result });
+    }
+
+    // 工程师核对任意候选标记集合下的裁决与稳定反例
+    if (req.method === 'POST' && url.pathname === '/api/placement/eval') {
+      const body = await readJson(req, 2 * 1024 * 1024);
+      const jobId = String(body?.jobId ?? '');
+      const spec = String(body?.spec ?? '');
+      if (!validJobId(jobId)) return sendJson(res, 400, { error: '非法 jobId' });
+      const marks = Array.isArray(body?.marks) ? body.marks.map(String) : [];
+      if (marks.some((m) => !/^[^\s]{1,128}$/.test(m))) {
+        return sendJson(res, 400, { error: '非法迁移标识' });
       }
-      // 同号任务也先作废，避免孤儿 worker；新规程取代旧任务同样终止
-      cancelJob(jobId);
-      if (supersedes) cancelJob(supersedes);
-      const result = await runJob(jobId, spec);
+      supersede(body, jobId);
+      const result = await runJob(jobId, { type: 'eval-marks', spec, marks });
       return sendJson(res, 200, { jobId, result });
     }
 
@@ -115,6 +144,14 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, err.statusCode ?? 500, { error: String(err.message ?? err) });
   }
 });
+
+const validJobId = (id) => /^[A-Za-z0-9_-]{1,64}$/.test(id);
+
+// 新任务携带 supersedes：先 terminate 旧 worker；同号任务同样先作废
+function supersede(body, jobId) {
+  cancelJob(jobId);
+  if (body?.supersedes) cancelJob(String(body.supersedes));
+}
 
 function readJson(req, limit) {
   return new Promise((resolve, reject) => {
