@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
-import { analyze } from './src/analyze.mjs';
+import { dispatchJob } from './src/analyze.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(__dirname, 'public');
@@ -22,14 +22,16 @@ const MIME = {
 // 活动判定任务：jobId -> { worker, finished }
 const jobs = new Map();
 
-function runJob(jobId, spec, { useWorker = true } = {}) {
+// payload: { kind: 'analyze'|'place'|'probe', spec, marked? }（字符串视为 analyze）
+function runJob(jobId, payload, { useWorker = true } = {}) {
+  const task = typeof payload === 'string' ? { kind: 'analyze', spec: payload } : payload;
   return new Promise((resolve, reject) => {
     if (!useWorker) {
-      try { resolve(analyze(spec)); } catch (e) { reject(e); }
+      try { resolve(dispatchJob(task)); } catch (e) { reject(e); }
       return;
     }
     const worker = new Worker(join(__dirname, 'src', 'worker.mjs'));
-    const rec = { worker, finished: false, reject };
+    const rec = { worker, finished: false, reject, timer: null };
     jobs.set(jobId, rec);
     const timer = setTimeout(() => {
       if (!rec.finished) {
@@ -39,6 +41,7 @@ function runJob(jobId, spec, { useWorker = true } = {}) {
         reject(Object.assign(new Error('计算超时（30s），任务已取消'), { statusCode: 409 }));
       }
     }, 30_000);
+    rec.timer = timer;
     worker.on('message', (msg) => {
       if (rec.finished || msg.jobId !== jobId) return; // 过期/陌生回执一律丢弃
       rec.finished = true;
@@ -55,7 +58,7 @@ function runJob(jobId, spec, { useWorker = true } = {}) {
       jobs.delete(jobId);
       reject(err);
     });
-    worker.postMessage({ type: 'run', jobId, spec });
+    worker.postMessage({ type: 'run', jobId, ...task });
   });
 }
 
@@ -63,6 +66,7 @@ function cancelJob(jobId) {
   const rec = jobs.get(jobId);
   if (rec && !rec.finished) {
     rec.finished = true;
+    clearTimeout(rec.timer); // 取消必须同时释放超时计时器，否则泄漏 30s
     rec.worker.terminate(); // 过期任务立即停止，不可能再回写任何结果
     jobs.delete(jobId);
     rec.reject(Object.assign(new Error('任务已被新规程取代或取消'), { statusCode: 409 }));
@@ -86,18 +90,26 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/analyze') {
-      const body = await readJson(req, 2 * 1024 * 1024);
-      const jobId = String(body?.jobId ?? '');
-      const spec = String(body?.spec ?? '');
-      const supersedes = body?.supersedes ? String(body.supersedes) : null;
-      if (!/^[A-Za-z0-9_-]{1,64}$/.test(jobId)) {
-        return sendJson(res, 400, { error: '非法 jobId' });
-      }
-      // 同号任务也先作废，避免孤儿 worker；新规程取代旧任务同样终止
-      cancelJob(jobId);
-      if (supersedes) cancelJob(supersedes);
-      const result = await runJob(jobId, spec);
-      return sendJson(res, 200, { jobId, result });
+      return await handleJob(req, res,
+        (body) => ({ kind: 'analyze', spec: String(body?.spec ?? '') }));
+    }
+
+    // 最小独立标记布设审计：同一任务/取消管理，过期任务不可能回写
+    if (req.method === 'POST' && url.pathname === '/api/markers') {
+      return await handleJob(req, res,
+        (body) => ({ kind: 'place', spec: String(body?.spec ?? '') }));
+    }
+
+    // 子集探查：查看任一（更小）标记集合下仍保留的稳定反例
+    if (req.method === 'POST' && url.pathname === '/api/markers/probe') {
+      return await handleJob(req, res, (body) => {
+        const marked = body?.marked;
+        if (!Array.isArray(marked) || marked.length > 512 ||
+            !marked.every((x) => typeof x === 'string' && /^\S{1,128}$/.test(x))) {
+          return { error: '非法标记集合（应为迁移标识数组）' };
+        }
+        return { kind: 'probe', spec: String(body?.spec ?? ''), marked };
+      });
     }
 
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/jobs/')) {
@@ -115,6 +127,23 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, err.statusCode ?? 500, { error: String(err.message ?? err) });
   }
 });
+
+// 任务型端点公共骨架：jobId 校验、过期任务取代、Worker 执行
+async function handleJob(req, res, buildTask) {
+  const body = await readJson(req, 2 * 1024 * 1024);
+  const jobId = String(body?.jobId ?? '');
+  const supersedes = body?.supersedes ? String(body.supersedes) : null;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(jobId)) {
+    return sendJson(res, 400, { error: '非法 jobId' });
+  }
+  const task = buildTask(body);
+  if (task.error) return sendJson(res, 400, { error: task.error });
+  // 同号任务也先作废，避免孤儿 worker；新规程取代旧任务同样终止
+  cancelJob(jobId);
+  if (supersedes) cancelJob(supersedes);
+  const result = await runJob(jobId, task);
+  return sendJson(res, 200, { jobId, result });
+}
 
 function readJson(req, limit) {
   return new Promise((resolve, reject) => {

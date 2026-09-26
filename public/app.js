@@ -1,4 +1,4 @@
-// app.js — 前端交互：过期任务防护、错误定位、裁决与证据渲染
+// app.js — 前端交互：过期任务防护、错误定位、裁决与证据渲染、最小独立标记布设审计
 'use strict';
 
 const $ = (id) => document.getElementById(id);
@@ -7,6 +7,7 @@ const gutter = $('gutter');
 const errorsBox = $('errors');
 const statusBox = $('status');
 const resultBox = $('result');
+const markersBox = $('markers');
 const submitBtn = $('submit');
 const cancelBtn = $('cancel');
 const dirtyFlag = $('dirty');
@@ -16,6 +17,7 @@ let activeJobId = null;
 let inflight = false;
 let jobCounter = 0;
 let lastResultStale = false; // 规程在得到结果后又被改动
+let lastPlacement = null; // 最近一次布设审计结果（探查面板的数据源）
 
 const EX_SILENT = `# 静默双环：故障迁移 f1 无回执（SILENT），
 # 故障后故障侧 (g1,g2) 与正常侧 (h1,h2) 回执序列都是 a,a,... 完全相同
@@ -61,8 +63,16 @@ ta.addEventListener('scroll', () => { gutter.scrollTop = ta.scrollTop; });
 ta.addEventListener('input', () => {
   renderGutter();
   if (inflight) invalidate('规程在计算期间被修改');
-  else if (activeJobId !== null) { lastResultStale = true; dirtyFlag.hidden = false; }
+  else if (activeJobId !== null) markStale();
 });
+
+// 结果过期标注：旧裁决与旧布设审计保留但降透明度，绝不覆盖当前草稿
+function markStale() {
+  lastResultStale = true;
+  dirtyFlag.hidden = false;
+  resultBox.classList.add('stale');
+  markersBox.classList.add('stale');
+}
 
 // ---- 过期任务处理 ----
 async function invalidate(reason) {
@@ -71,10 +81,11 @@ async function invalidate(reason) {
   activeJobId = null;
   submitBtn.disabled = false;
   cancelBtn.disabled = true;
+  refreshJobButtons();
   if (old) {
     try { await fetch(`/api/jobs/${encodeURIComponent(old)}`, { method: 'DELETE' }); } catch { /* 忽略 */ }
   }
-  dirtyFlag.hidden = false;
+  markStale();
   dirtyFlag.textContent = `${reason} · 已取消在途任务，旧结果保留但标记过期`;
   setStatus('idle', '在途任务已过期');
 }
@@ -92,27 +103,29 @@ function setStatus(kind, text, meta = '') {
   }
 }
 
-// ---- 提交 ----
-submitBtn.addEventListener('click', submitSpec);
-async function submitSpec() {
-  // 新提交取代旧任务
+// ---- 任务骨架：代次守卫 + 取代旧任务 ----
+// 任何新任务（判定/布设/探查）都取代旧任务；迟到响应一律丢弃，
+// 不可能改写当前草稿或新结果。
+async function runJob(endpoint, body, { onBusy, onResult, onError }) {
   const previous = activeJobId;
   const jobId = `j${Date.now().toString(36)}-${++jobCounter}`;
   activeJobId = jobId;
   inflight = true;
   lastResultStale = false;
   dirtyFlag.hidden = true;
+  resultBox.classList.remove('stale');
+  markersBox.classList.remove('stale');
   submitBtn.disabled = true;
   cancelBtn.disabled = false;
   errorsBox.hidden = true;
-  resultBox.innerHTML = '';
-  setStatus('computing', '判定计算中…（verifier 同步积 + 环分析）');
+  refreshJobButtons();
+  onBusy?.();
 
   try {
-    const resp = await fetch('/api/analyze', {
+    const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jobId, supersedes: previous, spec: ta.value }),
+      body: JSON.stringify({ ...body, jobId, supersedes: previous }),
     });
     const payload = await resp.json();
     // 过期任务防护：只有仍是当前任务时才允许落地
@@ -120,26 +133,56 @@ async function submitSpec() {
     inflight = false;
     submitBtn.disabled = false;
     cancelBtn.disabled = true;
+    refreshJobButtons();
 
     // 409：该任务在服务端已被新规程取代或被取消，UI 已由新动作接管，静默
     if (resp.status === 409) return;
     if (!resp.ok) {
-      renderFatal(payload.error ?? `请求失败 ${resp.status}`);
+      onError?.(payload.error ?? `请求失败 ${resp.status}`);
       return;
     }
-    renderResult(payload.result);
+    onResult(payload.result);
   } catch (err) {
     if (jobId !== activeJobId) return; // 取消导致的中断，忽略
     inflight = false;
     submitBtn.disabled = false;
     cancelBtn.disabled = true;
-    renderFatal(String(err));
+    refreshJobButtons();
+    onError?.(String(err));
   }
+}
+
+function refreshJobButtons() {
+  const placeBtn = $('place-markers');
+  if (placeBtn) placeBtn.disabled = inflight;
+  const count = $('probe-count');
+  if (count && lastPlacement && !lastPlacement.baseDiagnosable) {
+    count.textContent = `已选 ${probeSelection().length} / 最少 ${lastPlacement.minCount} 个标记`;
+  }
+  const probeBtn = $('probe-run');
+  if (probeBtn) probeBtn.disabled = inflight || !probeReady();
+}
+
+// ---- 提交判定 ----
+submitBtn.addEventListener('click', submitSpec);
+function submitSpec() {
+  lastPlacement = null;
+  markersBox.innerHTML = '';
+  runJob('/api/analyze', { spec: ta.value }, {
+    onBusy: () => {
+      resultBox.innerHTML = '';
+      setStatus('computing', '判定计算中…（verifier 同步积 + 环分析）');
+    },
+    onResult: renderResult,
+    onError: renderFatal,
+  });
 }
 
 function renderFatal(msg) {
   setStatus('idle', '未裁决');
   resultBox.innerHTML = '';
+  markersBox.innerHTML = '';
+  lastPlacement = null;
   errorsBox.hidden = false;
   errorsBox.innerHTML = `<h3>服务错误</h3><ul><li>${escapeHtml(msg)}</li></ul>`;
 }
@@ -148,6 +191,8 @@ function renderFatal(msg) {
 function renderErrors(errors) {
   // 清除旧结论
   resultBox.innerHTML = '';
+  markersBox.innerHTML = '';
+  lastPlacement = null;
   setStatus('idle', '规程非法，未进行裁决（旧结论已清除）');
   const badLines = new Set();
   errorsBox.hidden = false;
@@ -196,6 +241,19 @@ function renderResult(r) {
   }
   setStatus('nondiag', '不可诊断：存在已发生故障的无限执行与正常无限执行，回执序列完全相同', meta);
   resultBox.innerHTML = witnessCard(r.witness) + checkedPairsCard(r.checkedPairs, true);
+  // 判为不可诊断后，值班工程师可发起最小独立标记布设审计
+  markersBox.innerHTML = `
+    <div class="card place-intro">
+      <h3>最小独立标记布设审计</h3>
+      <div class="tabs">
+        为最少的故障迁移加装<strong>专属可观察标记</strong>（其故障侧回执成为仅该迁移可产生的独立观测），
+        使任何已发生故障的无限执行都无法再被始终正常的执行伪装。
+        求解从每个仍存在的无限伪装见证提取必须命中的故障迁移集合，
+        以精确分支定界求全局最小布设，不改写原规程。
+      </div>
+      <button id="place-markers" type="button">发起最小独立标记布设审计</button>
+    </div>`;
+  $('place-markers').addEventListener('click', startPlacement);
 }
 
 function witnessCard(w) {
@@ -270,6 +328,208 @@ function checkedPairsCard(pairs, compact = false) {
       ${rows}
     </table>
   </div>`;
+}
+
+// ---- 最小独立标记布设审计 ----
+function startPlacement() {
+  runJob('/api/markers', { spec: ta.value }, {
+    onBusy: () => {
+      markersBox.innerHTML = `
+        <div class="card">
+          <h3>最小独立标记布设审计</h3>
+          <div class="tabs">布设求解中…（约束生成 + 精确分支定界，逐轮复核合格双侧闭环）</div>
+        </div>`;
+    },
+    onResult: (r) => {
+      if (!r.ok) return renderErrors(r.errors);
+      lastPlacement = r;
+      renderPlacement(r);
+    },
+    onError: (msg) => {
+      markersBox.innerHTML = `
+        <div class="card">
+          <h3>最小独立标记布设审计</h3>
+          <div class="tabs" style="color:var(--bad)">${escapeHtml(msg)}</div>
+        </div>`;
+    },
+  });
+}
+
+function renderPlacement(r) {
+  if (r.baseDiagnosable) {
+    // 原规程本已可诊断 ⇒ 明确的空布设
+    markersBox.innerHTML = `
+      <div class="card">
+        <h3>最小独立标记布设审计</h3>
+        <div class="tabs">
+          原规程本已可诊断，无需任何标记：<strong>空布设（最少标记数 0）</strong>。
+        </div>
+      </div>`;
+    return;
+  }
+
+  const markerTags = r.markers.map((m) => `<code class="marker">${escapeHtml(m)}</code>`).join(' ');
+  // 每个被选标记打断的反例约束（约束编号）
+  const breaks = new Map(r.markers.map((m) => [m, []]));
+  for (const c of r.constraints) {
+    for (const m of c.hitBy) breaks.get(m)?.push(c.index);
+  }
+  const markerRows = r.markers.map((m) => {
+    const hit = breaks.get(m) ?? [];
+    return `<tr>
+      <td class="mono"><code class="marker">${escapeHtml(m)}</code></td>
+      <td>${hit.length
+        ? hit.map((i) => `<span class="tag constraint">约束 #${i}</span>`).join('')
+        : '<span class="silent">—</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  const constraintRows = r.constraints.map((c) => {
+    const w = c.witness;
+    const seqP = w.prefixObservable.map((x) => escapeHtml(x)).join(' ') || '∅';
+    const seqL = w.loopObservable.map((x) => escapeHtml(x)).join(' ');
+    return `<tr>
+      <td>#${c.index}</td>
+      <td class="mono">${c.set.map((x) => `<code>${escapeHtml(x)}</code>`).join(' ')}</td>
+      <td>${c.hitBy.map((x) => `<code class="marker">${escapeHtml(x)}</code>`).join(' ')}</td>
+      <td class="mono">
+        入口 ${escapeHtml(w.entry.p)}×${escapeHtml(w.entry.q)}；
+        前缀 [${seqP}]；闭环 [${seqL} ]ω
+      </td>
+    </tr>`;
+  }).join('');
+
+  markersBox.innerHTML = `
+    <div class="card verdict-place">
+      <h3>布设裁决：最少标记数 ${r.minCount}</h3>
+      <div class="tabs">按迁移标识稳定裁决的标记集合：${markerTags}</div>
+      <div class="tabs">
+        应用该集合后的新裁决：<strong style="color:var(--good)">可诊断</strong>
+        （标记后 verifier 状态 ${r.finalVerdict.verifierStates}）——
+        任何已发生故障的无限执行都不再被始终正常的执行伪装。
+      </div>
+    </div>
+    <div class="card">
+      <h3>每个被选标记打断的反例约束</h3>
+      <table>
+        <tr><th>被选标记</th><th>打断的反例约束</th></tr>
+        ${markerRows}
+      </table>
+    </div>
+    <div class="card">
+      <h3>反例约束族（每轮从仍存在的无限伪装见证提取，共 ${r.constraints.length} 条）</h3>
+      <table>
+        <tr><th>约束</th><th>必须命中的故障迁移集合</th><th>被命中标记</th><th>见证摘要</th></tr>
+        ${constraintRows}
+      </table>
+    </div>
+    ${probeCard(r)}
+    ${checkedPairsCard(r.finalVerdict.checkedPairs, true)}
+    <div id="probe-result"></div>`;
+
+  $('probe-run').addEventListener('click', runProbe);
+  markersBox.querySelectorAll('input[data-probe]').forEach((cb) =>
+    cb.addEventListener('change', refreshJobButtons));
+  refreshJobButtons();
+}
+
+// 探查面板：允许查看任一更小集合仍保留的稳定反例
+function probeCard(r) {
+  const boxes = r.faultyTransitions.map((id) => {
+    const on = r.markers.includes(id);
+    return `<label class="probe-item${on ? ' on' : ''}">
+      <input type="checkbox" data-probe value="${escapeHtml(id)}" ${on ? 'checked' : ''} />
+      <code>${escapeHtml(id)}</code></label>`;
+  }).join('');
+  return `
+    <div class="card">
+      <h3>最小性核验：探查任一更小集合</h3>
+      <div class="tabs">
+        勾选任意故障迁移子集（少于最少标记数 ${r.minCount} 个），
+        查看该集合下仍保留的稳定反例摘要——任何更小集合都必然仍有无限伪装见证。
+      </div>
+      <div class="probe-grid">${boxes}</div>
+      <div class="tabs" style="margin-top:8px">
+        <span id="probe-count"></span>
+        <button id="probe-run" type="button">探查该更小集合保留的反例</button>
+      </div>
+    </div>`;
+}
+
+function probeSelection() {
+  return [...markersBox.querySelectorAll('input[data-probe]')]
+    .filter((cb) => cb.checked).map((cb) => cb.value);
+}
+
+function probeReady() {
+  if (!lastPlacement || lastPlacement.baseDiagnosable) return false;
+  const k = probeSelection().length;
+  return k < lastPlacement.minCount;
+}
+
+function runProbe() {
+  const marked = probeSelection();
+  runJob('/api/markers/probe', { spec: ta.value, marked }, {
+    onBusy: () => {
+      const box = $('probe-result');
+      if (box) box.innerHTML = `
+        <div class="card"><h3>子集探查</h3>
+        <div class="tabs">复核中…（以该集合标记后重新判定）</div></div>`;
+    },
+    onResult: (r) => {
+      if (!r.ok) {
+        const box = $('probe-result');
+        if (box) box.innerHTML = `
+          <div class="card"><h3>子集探查</h3>
+          <div class="tabs" style="color:var(--bad)">${escapeHtml(r.markerError ?? '规程存在录入错误，无法探查')}</div></div>`;
+        return;
+      }
+      renderProbe(r);
+    },
+    onError: (msg) => {
+      const box = $('probe-result');
+      if (box) box.innerHTML = `
+        <div class="card"><h3>子集探查</h3>
+        <div class="tabs" style="color:var(--bad)">${escapeHtml(msg)}</div></div>`;
+    },
+  });
+}
+
+function renderProbe(r) {
+  const box = $('probe-result');
+  if (!box) return;
+  const setDesc = r.marked.length
+    ? r.marked.map((m) => `<code>${escapeHtml(m)}</code>`).join(' ')
+    : '∅（空集合）';
+  if (r.diagnosable) {
+    box.innerHTML = `
+      <div class="card">
+        <h3>子集探查：${setDesc}</h3>
+        <div class="tabs" style="color:var(--good)">该集合下已可诊断，不再保留任何反例。</div>
+      </div>`;
+    return;
+  }
+  const w = r.witness;
+  const seqP = w.prefixObservable.map((x) => escapeHtml(x)).join(' ') || '∅';
+  const seqL = w.loopObservable.map((x) => escapeHtml(x)).join(' ');
+  const faultyInWitness = [...new Set(
+    [...w.prefix, ...w.loop]
+      .filter((s) => s.faultySide?.transId && s.faultySide.faulty)
+      .map((s) => s.faultySide.transId))]
+    .sort((a, b) => a.localeCompare(b));
+  box.innerHTML = `
+    <div class="card">
+      <h3>子集探查：${setDesc} ⇒ 仍不可诊断</h3>
+      <div class="tabs">该更小集合保留的稳定反例摘要：</div>
+      <div class="seq">入口对 ${escapeHtml(w.entry.p)} × ${escapeHtml(w.entry.q)}；
+        前缀 [${seqP}]；闭环 [${seqL} ]ω</div>
+      <div class="tabs" style="margin-top:8px">
+        见证仍经过的故障迁移：${faultyInWitness.map((x) => `<code>${escapeHtml(x)}</code>`).join(' ')}
+        · ${w.sequencesIdentical
+          ? '<span style="color:var(--good)">✓ 两侧可观察序列逐元素相同</span>'
+          : '<span style="color:var(--bad)">✗ 内部校验失败</span>'}
+      </div>
+    </div>`;
 }
 
 function escapeHtml(s) {

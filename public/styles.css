@@ -154,3 +154,35 @@ td.mono, th.mono { font-family: ui-monospace, monospace; }
 .silent { color: var(--muted); }
 .pair-table tr.looprow td { background: rgba(55,192,125,.07); }
 footer { padding: 10px 28px 22px; color: var(--muted); font-size: 12px; }
+
+/* 最小独立标记布设审计 */
+.stale { opacity: .45; }
+.place-intro button { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+code.marker {
+  background: var(--good-bg);
+  border: 1px solid var(--good);
+  color: var(--good);
+  border-radius: 4px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+.tag.constraint { color: var(--warn); border-color: var(--warn); }
+.verdict-place { border-color: var(--good); }
+.probe-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 6px;
+}
+.probe-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.probe-item.on { color: var(--good); }
+.probe-item input { accent-color: var(--accent); }
+#probe-count { color: var(--muted); margin-right: 10px; }

@@ -142,6 +142,60 @@ trans n1 0 2 N a
   const h = await r.json();
   expect(h.activeJobs === 0, '取消/完成后无残留任务');
 
+  // 7) 最小独立标记布设审计：静默双环 ⇒ 最少 1 个标记 {f1}，新裁决可诊断
+  r = await fetch(`${base}/api/markers`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-m1', spec: silentCase }),
+  });
+  payload = await r.json();
+  expect(r.status === 200, '布设审计 API 200');
+  expect(payload.result?.baseDiagnosable === false, '静默双环非空布设');
+  expect(payload.result?.minCount === 1, '最少标记数为 1');
+  expect(Array.isArray(payload.result?.markers) && payload.result.markers[0] === 'f1',
+    '稳定裁决标记集合为 {f1}');
+  expect(payload.result?.finalVerdict?.diagnosable === true, '应用标记后的新裁决为可诊断');
+  expect(Array.isArray(payload.result?.constraints) &&
+    payload.result.constraints.length >= 1 &&
+    payload.result.constraints.every((c) => c.hitBy.includes('f1')),
+    '每条反例约束都标注被哪个被选标记打断');
+
+  // 8) 本已可诊断 ⇒ 明确空布设
+  r = await fetch(`${base}/api/markers`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-m2', spec: diagCase }),
+  });
+  payload = await r.json();
+  expect(payload.result?.baseDiagnosable === true &&
+    payload.result?.minCount === 0 &&
+    payload.result?.markers?.length === 0, '可诊断例返回明确的空布设');
+
+  // 9) 子集探查：空集合保留稳定反例；装上 f1 后可诊断；非法标记报错
+  r = await fetch(`${base}/api/markers/probe`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-p1', spec: silentCase, marked: [] }),
+  });
+  payload = await r.json();
+  expect(payload.result?.diagnosable === false && payload.result?.witness,
+    '空集合探查仍不可诊断且给出稳定反例');
+  r = await fetch(`${base}/api/markers/probe`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-p2', spec: silentCase, marked: ['f1'] }),
+  });
+  payload = await r.json();
+  expect(payload.result?.diagnosable === true, '装上 f1 后探查可诊断');
+  r = await fetch(`${base}/api/markers/probe`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'smoke-p3', spec: silentCase, marked: ['g1'] }),
+  });
+  payload = await r.json();
+  expect(payload.result?.ok === false && /不是故障迁移/.test(payload.result?.markerError ?? ''),
+    '非故障迁移标记被明确拒绝');
+
   cancelJob?.('not-a-job'); // 覆盖取消不存在任务的路径
   if (server) await new Promise((r) => server.close(r));
   console.log(failures === 0 ? '\n[verify] HTTP 冒烟全部通过' : `\n[verify] HTTP 冒烟失败 ${failures} 处`);
@@ -149,24 +203,27 @@ trans n1 0 2 N a
 }
 
 async function main() {
-  console.log('[verify] 1/4 构建检查（node --check 所有源文件）');
+  console.log('[verify] 1/5 构建检查（node --check 所有源文件）');
   const files = [
-    'server.js', 'src/parser.mjs', 'src/diagnoser.mjs',
+    'server.js', 'src/parser.mjs', 'src/diagnoser.mjs', 'src/markers.mjs',
     'src/analyze.mjs', 'src/worker.mjs', 'public/app.js',
-    'scripts/fuzz.mjs', 'scripts/verify.mjs',
+    'scripts/fuzz.mjs', 'scripts/fuzz_markers.mjs', 'scripts/verify.mjs',
   ];
   for (const f of files) {
     const code = await run('node', ['--check', f]);
     if (code !== 0) process.exit(1);
   }
 
-  console.log('\n[verify] 2/4 单元测试');
+  console.log('\n[verify] 2/5 单元测试');
   if ((await run('node', ['--test', 'test/'])) !== 0) process.exit(1);
 
-  console.log('\n[verify] 3/4 随机模型交叉验证（2000 例）');
+  console.log('\n[verify] 3/5 随机模型交叉验证（2000 例）');
   if ((await run('node', ['scripts/fuzz.mjs', '777', '2000'])) !== 0) process.exit(1);
 
-  console.log('\n[verify] 4/4 HTTP 冒烟');
+  console.log('\n[verify] 4/5 标记布设交叉验证（暴力枚举参照，1000 例）');
+  if ((await run('node', ['scripts/fuzz_markers.mjs', '4242', '1000'])) !== 0) process.exit(1);
+
+  console.log('\n[verify] 5/5 HTTP 冒烟');
   if ((await smoke()) !== 0) process.exit(1);
 
   console.log('\n[verify] ✅ 全部检查通过，verify 正常退出（exit 0）');

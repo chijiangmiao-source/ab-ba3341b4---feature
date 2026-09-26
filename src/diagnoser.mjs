@@ -16,11 +16,18 @@
 // 不可诊断 ⇔ 从初态可达的某个 f=1 SCC 中，存在一条“合格闭环”：
 // 闭环内既有移动故障副本的边、又有移动正常副本的边（因此闭环重复时
 // 两侧都是无限执行；仅故障副本静默自环、正常侧停滞不算）。
+//
+// 独立标记布设：marked 中的故障迁移在故障侧产生“仅该迁移可产生”的
+// 专属观测（无论原本是否静默）。该观测正常副本永远无法匹配，因此任何
+// 经过它的故障执行立即暴露——在 verifier（只跟踪仍可混淆的执行对）中
+// 故障副本直接不再经过这些迁移。不改写原规程，仅改变同步积的可用边。
 
-export function buildVerifier(model) {
+export function buildVerifier(model, marked = new Set()) {
   const { init, transitions } = model;
   const out = new Map();
   for (const t of transitions) {
+    // 被标记的故障迁移：故障侧回执成为独立观测，无法进入任何混淆对
+    if (t.faulty && marked.has(t.id)) continue;
     if (!out.has(t.src)) out.set(t.src, []);
     out.get(t.src).push(t);
   }
@@ -265,8 +272,8 @@ function qualifyingCycle(s, compOf, cid) {
   return recToEdges(goalRec);
 }
 
-export function diagnose(model) {
-  const v = buildVerifier(model);
+export function diagnose(model, marked = new Set()) {
+  const v = buildVerifier(model, marked);
   const { compOf, comps } = tarjan(v.states);
   const fromStart = reachable(v.start);
 
